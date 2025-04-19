@@ -1,0 +1,11 @@
+faiss-cpu
+numpy
+sentence_transformers
+click
+tqdm
+openai
+langchain
+rich
+dotenv
+langchain-community
+langchain-openai
