@@ -23,10 +23,10 @@ import os
 import re
 import sys
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import openai
 from dotenv import load_dotenv
@@ -57,6 +57,7 @@ client = openai.OpenAI(api_key=OPENAI_API_KEY)
 INDEX_DIR = Path("memory_index")
 HASH_PATH = INDEX_DIR / "doc_hashes.json"
 PROFILE_PATH = Path("high_level_memory.json")
+CHAT_LOG_PATH = Path("chat_history.jsonl")
 
 EMBED_MODEL = "text-embedding-3-small"  # adjust if you prefer large
 CHAT_MODEL = "gpt-4.1-2025-04-14"
@@ -233,16 +234,63 @@ def format_retrieved(pairs: List[Tuple[Document, float]], k_top: int = 3) -> str
     return "\n".join(out)[:5000]
 
 
-def build_prompt(user_msg: str, profile_summary: str, retrieved: str) -> List[Dict]:
+def build_prompt(
+    user_msg: str, profile_summary: str, retrieved: str, recent_chat: Optional[str]
+) -> List[Dict]:
     header = (
         "You are an assistant with access to the user's long‑term memories.\n\n"
-        f"USER_PROFILE:\n{profile_summary}\n\nRETRIEVED_MEMORIES:\n{retrieved}\n\n"
-        "Use memories when helpful, otherwise ignore. Answer directly."
+        f"USER_PROFILE:\n{profile_summary}\n\nRETRIEVED_MEMORIES:\n{retrieved}\n"
     )
+    if recent_chat:
+        header += f"\nRECENT_CHAT_LOGS:\n{recent_chat}\n"
+    header += "\nUse memories when helpful, otherwise ignore. Answer directly."
     return [
         {"role": "system", "content": header},
         {"role": "user", "content": user_msg},
     ]
+
+
+# ─── chat history helpers ───────────────────────────────────────────────────
+def append_chat_log(role: str, content: str, ts: str):
+    entry = {"role": role, "content": content, "time": ts}
+    with CHAT_LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def load_chat_logs() -> List[Dict]:
+    if not CHAT_LOG_PATH.exists():
+        return []
+    lines = [ln for ln in CHAT_LOG_PATH.read_text().splitlines() if ln.strip()]
+    return [json.loads(ln) for ln in lines]
+
+
+def recent_chat_snippet(user_msg: str, max_entries: int = 20) -> Optional[str]:
+    text = user_msg.lower()
+    need = False
+    since = None
+    if "yesterday" in text:
+        since = datetime.utcnow() - timedelta(days=1)
+        need = True
+    elif any(
+        k in text for k in ["last chat", "previous chat", "previous conversation", "last time", "continue"]
+    ):
+        need = True
+
+    if not need:
+        return None
+
+    logs = load_chat_logs()
+    if since:
+        logs = [
+            l
+            for l in logs
+            if l.get("time") and datetime.fromisoformat(l["time"]) >= since
+        ]
+    else:
+        logs = logs[-max_entries:]
+
+    snippet = "\n".join(f"{l['role']}: {l['content']}" for l in logs[-max_entries:])
+    return snippet or None
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -259,7 +307,10 @@ def chat_loop():
             break
 
         retrieved = format_retrieved(vmem.search(user_msg, k=5))
-        messages = build_prompt(user_msg, pmem.summary(LATEST_PROFILE_N), retrieved)
+        recent = recent_chat_snippet(user_msg)
+        messages = build_prompt(
+            user_msg, pmem.summary(LATEST_PROFILE_N), retrieved, recent
+        )
 
         resp = client.chat.completions.create(model=CHAT_MODEL, messages=messages, temperature=0.7)
         assistant_msg = resp.choices[0].message.content.strip()
@@ -273,6 +324,8 @@ def chat_loop():
                 Document(page_content=assistant_msg, metadata={"role": "assistant", "time": now}),
             ]
         )
+        append_chat_log("user", user_msg, now)
+        append_chat_log("assistant", assistant_msg, now)
 
         # profile extraction
         for msg in (user_msg, assistant_msg):
